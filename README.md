@@ -52,6 +52,9 @@ pwsh ./bridge.ps1 screenshot dialog.png
 pwsh ./bridge.ps1 key Escape          # or: pwsh ./bridge.ps1 stop
 ```
 
+Runnable end-to-end scripts live in [`examples/`](examples/) (`capture-dialog.ps1`,
+`capture-sprite.ps1`).
+
 ## Commands
 
 | Command | Description |
