@@ -1,7 +1,8 @@
 # Aseprite Bridge
 
-Drive a **live Aseprite GUI** from the shell — open files, run Lua, and
-**screenshot modal dialogs** — without the OS fighting you over window focus.
+Drive a **live Aseprite GUI** from the shell — open files, run Lua,
+**screenshot modal dialogs**, and **drive those dialogs with the keyboard** —
+without the OS fighting you over window focus.
 
 Aseprite's `--script` works great in batch (`-b`) mode, but batch has no window,
 so you can't screenshot the UI. And launching a GUI Aseprite from a background
@@ -55,6 +56,27 @@ pwsh ./bridge.ps1 key Escape          # or: pwsh ./bridge.ps1 stop
 Runnable end-to-end scripts live in [`examples/`](examples/) (`capture-dialog.ps1`,
 `capture-sprite.ps1`).
 
+### Driving a dialog with the keyboard
+
+You can also *interact* with a dialog, not just screenshot it. Synthetic
+keystrokes are delivered with **`PostMessage`** straight to the window handle, so
+— like `PrintWindow` — they land **without stealing foreground**. Aseprite's UI
+(laf) navigates by keyboard: `Tab` moves focus, `Space` toggles a checkbox,
+`Enter` activates the focused/default button, `Esc` cancels, and typing fills the
+focused entry.
+
+```powershell
+# open a modal that sets a global when its OK button fires
+pwsh ./bridge.ps1 run -NoWait "_G.OK=false; local d=Dialog('x'); d:entry{id='name',focus=true}; d:button{id='ok',text='OK',onclick=function() _G.OK=true; d:close() end}; d:show{wait=true}"
+pwsh ./bridge.ps1 type "hero"          # fill the focused entry
+pwsh ./bridge.ps1 keys "Tab Enter"     # Tab to OK, then activate it
+pwsh ./bridge.ps1 run  "return tostring(_G.OK)"   # -> "true": the dialog committed
+```
+
+The first widget already has focus when a dialog opens — don't add a leading
+`Tab`. Tune the inter-key pace with `-DelayMs` (default 60). See
+[limitations](#notes--caveats) for what keyboard input can and can't reach.
+
 ## Commands
 
 | Command | Description |
@@ -63,7 +85,9 @@ Runnable end-to-end scripts live in [`examples/`](examples/) (`capture-dialog.ps
 | `open <file>` | Open a sprite file. |
 | `run <lua> [-NoWait]` | Run a Lua chunk in Aseprite. Returns its value; `-NoWait` for modal-opening code. |
 | `screenshot <out.png>` | Capture the Aseprite window (including any open dialog) via `PrintWindow`. |
-| `key <Key>` | Send a keystroke (`SendKeys` syntax, e.g. `Escape`, `Enter`). |
+| `key <Key>` | Send one key — a named key (`Tab`, `Enter`, `Space`, `Esc`, `Up`…`F12`) or a single character. |
+| `keys "<seq>"` | Send a space-separated sequence, e.g. `"Tab Tab Space Enter"`. |
+| `type "<text>"` | Type literal text into the focused entry. |
 | `ping` | Check the agent is alive. |
 | `stop` | Quit the instance. |
 
@@ -78,6 +102,7 @@ Runnable end-to-end scripts live in [`examples/`](examples/) (`capture-dialog.ps
                                           ▼
  bridge.ps1  ◀──reads───  .aseprite-bridge/res/<seq>.res     # for open/run/ping
  bridge.ps1  ──PrintWindow──▶  out.png                       # for screenshot (native, no agent)
+ bridge.ps1  ──PostMessage──▶  Aseprite window               # for key/keys/type (native, no agent)
 ```
 
 - **Protocol** is plain files: `cmd/<seq>.cmd` (op + arg) → `res/<seq>.res`
@@ -110,6 +135,31 @@ Runnable end-to-end scripts live in [`examples/`](examples/) (`capture-dialog.ps
   may differ.
 - The grant hash keys on the extension's **absolute path**, so re-run
   `install.ps1` (not `-Symlink`) if you move the repo, then `start` re-grants.
+
+### Keyboard input limitations
+
+`key`/`keys`/`type` deliver `WM_KEYDOWN`/`WM_KEYUP` via `PostMessage`, which laf
+turns into key events **without foreground**. But `PostMessage` cannot modify the
+target process's keyboard state, so a few things are out of reach:
+
+- **No modifiers.** `Shift`/`Ctrl`/`Alt` combos (and therefore **uppercase
+  letters and shifted symbols**) don't register — laf reads modifier state from
+  the keyboard-state table, which only real hardware / `SendInput` updates. `type`
+  warns when it sees a character that needs Shift; it still sends the unshifted
+  key. Text arrives lowercase.
+- **Combobox dropdowns.** A combobox's open dropdown is a separate popup that
+  doesn't take arrow keys through the main window handle, so you can't reliably
+  pick an option by keyboard. Same goes for **mouse-only canvas widgets** (e.g.
+  `dialog_utils.scrollableList`). These need real coordinate clicks.
+- **First widget is pre-focused** on open — start interacting immediately; a
+  leading `Tab` skips past it.
+- Delivery requires the window to be **un-minimized**; the bridge restores it
+  (without activating) before sending keys or capturing.
+
+Everything else a native dialog needs — entry text (lowercase/digits), `Tab`
+navigation, `Space` to toggle checks, `Enter` to activate buttons, `Esc` to
+cancel — works headlessly. Full-fidelity input (modifiers, uppercase) would mean
+`SendInput`, which requires bringing the window to the foreground.
 
 ## License
 
