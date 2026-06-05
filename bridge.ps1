@@ -5,7 +5,9 @@
 #   pwsh ./bridge.ps1 run  "<lua code>"     # run Lua in Aseprite (returns its value)
 #   pwsh ./bridge.ps1 run  "<lua>" -NoWait  # for code that opens a modal dialog
 #   pwsh ./bridge.ps1 screenshot <out.png>  # capture the Aseprite window (incl. dialogs)
-#   pwsh ./bridge.ps1 key Escape            # send a key (e.g. dismiss a modal)
+#   pwsh ./bridge.ps1 key Escape            # send one key (name or char)
+#   pwsh ./bridge.ps1 keys "Tab Tab Space Enter"   # send a sequence of keys
+#   pwsh ./bridge.ps1 type "hello"          # type literal text into the focused entry
 #   pwsh ./bridge.ps1 ping                  # check the agent is alive
 #   pwsh ./bridge.ps1 stop                  # quit the instance
 #
@@ -18,6 +20,7 @@ param(
   [Parameter(Position = 1)][string]$Arg,
   [switch]$NoWait,
   [int]$TimeoutSec = 25,
+  [int]$DelayMs = 60,
   [string]$Aseprite = $env:ASEPRITE_EXE
 )
 $ErrorActionPreference = "Stop"
@@ -51,6 +54,11 @@ public class AseCap {
   [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+  [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
+  [DllImport("user32.dll")] public static extern short VkKeyScan(char ch);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   public static Win[] GetWindows(int pid) {
     var list = new ArrayList();
     EnumWindows((h, l) => {
@@ -107,6 +115,8 @@ function Get-MainWindow {
 function Capture-To([string]$out) {
   $win = Get-MainWindow
   if (-not $win) { throw "No capturable Aseprite window." }
+  Ensure-Restored $win
+  $win = Get-MainWindow  # re-read rect after a possible restore
   if (-not [System.IO.Path]::IsPathRooted($out)) { $out = Join-Path (Get-Location) $out }
   Add-Type -AssemblyName System.Drawing
   $w = $win.Right - $win.Left; $h = $win.Bottom - $win.Top
@@ -118,6 +128,78 @@ function Capture-To([string]$out) {
   $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
   $bmp.Dispose()
   Write-Host "screenshot -> $out (${w}x${h})"
+}
+
+# --- keyboard input (synthetic keystrokes via PostMessage) ---------------------
+# laf processes WM_KEYDOWN/WM_KEYUP posted straight to the window handle, so keys
+# land WITHOUT stealing foreground (same win as PrintWindow for screenshots). It
+# does NOT honour the cross-process keyboard state, so Shift/Ctrl/Alt modifiers and
+# uppercase/shifted characters cannot be delivered this way -- see README.
+$WM_KEYDOWN = 0x100; $WM_KEYUP = 0x101
+
+# Named keys -> virtual-key code. Case-insensitive; aliases included.
+$KeyMap = @{
+  enter=0x0D; return=0x0D; tab=0x09; space=0x20; spacebar=0x20; esc=0x1B; escape=0x1B
+  backspace=0x08; bksp=0x08; delete=0x2E; del=0x2E; insert=0x2D; ins=0x2D
+  up=0x26; down=0x28; left=0x25; right=0x27
+  home=0x24; end=0x23; pageup=0x21; pgup=0x21; pagedown=0x22; pgdn=0x22
+  f1=0x70; f2=0x71; f3=0x72; f4=0x73; f5=0x74; f6=0x75
+  f7=0x76; f8=0x77; f9=0x78; f10=0x79; f11=0x7A; f12=0x7B
+}
+# Keys that need the extended-key flag set in lParam bit 24.
+$ExtKeys = @(0x26,0x28,0x25,0x27,0x24,0x23,0x21,0x22,0x2E,0x2D)
+
+function Resolve-Vk([string]$token) {
+  $t = $token.ToLower()
+  if ($KeyMap.ContainsKey($t)) { return [int]$KeyMap[$t] }
+  if ($token.Length -eq 1) {
+    $vks = [AseCap]::VkKeyScan($token[0])
+    if ($vks -ne -1) { return ($vks -band 0xFF) }  # low byte = VK (shift bit ignored)
+  }
+  throw "unknown key token: '$token' (use a letter/digit or a named key like Tab, Enter, Space, Up)"
+}
+
+function Send-Vk([IntPtr]$hwnd, [int]$vk, [int]$delayMs) {
+  $scan = [AseCap]::MapVirtualKey([uint32]$vk, 0)
+  $ext  = if ($ExtKeys -contains $vk) { 0x01000000 } else { 0 }
+  $lpDown = [IntPtr](([int64]$scan -shl 16) -bor 1 -bor $ext)
+  $lpUp   = [IntPtr](([int64]$scan -shl 16) -bor 0xC0000001 -bor $ext)
+  [AseCap]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$vk, $lpDown) | Out-Null
+  [AseCap]::PostMessage($hwnd, $WM_KEYUP,   [IntPtr]$vk, $lpUp)   | Out-Null
+  Start-Sleep -Milliseconds $delayMs
+}
+
+# Un-minimize without activating: laf draws dialogs inside the main window, so a
+# minimized window swallows both keystrokes and screenshots.
+function Ensure-Restored($win) {
+  if ($win -and [AseCap]::IsIconic($win.Handle)) {
+    [AseCap]::ShowWindow($win.Handle, 4) | Out-Null  # SW_SHOWNOACTIVATE
+    Start-Sleep -Milliseconds 150
+  }
+}
+
+function Send-Keys([string]$seq, [int]$delayMs) {
+  $win = Get-MainWindow
+  if (-not $win) { throw "No Aseprite window to send keys to." }
+  Ensure-Restored $win
+  $tokens = $seq -split '\s+' | Where-Object { $_ -ne '' }
+  foreach ($tok in $tokens) { Send-Vk $win.Handle (Resolve-Vk $tok) $delayMs }
+  Write-Host "sent keys: $($tokens -join ' ')"
+}
+
+function Send-Type([string]$text, [int]$delayMs) {
+  $win = Get-MainWindow
+  if (-not $win) { throw "No Aseprite window to type into." }
+  Ensure-Restored $win
+  $shifted = ''
+  foreach ($ch in $text.ToCharArray()) {
+    $vks = [AseCap]::VkKeyScan($ch)
+    if ($vks -eq -1) { continue }
+    if (($vks -band 0x100) -ne 0 -and $ch -ne ' ') { $shifted += $ch }  # needs Shift -> unreliable
+    Send-Vk $win.Handle ($vks -band 0xFF) $delayMs
+  }
+  Write-Host "typed: $text"
+  if ($shifted) { Write-Host "WARNING: characters '$shifted' need Shift, which PostMessage cannot deliver -- they arrived lowercase/unshifted." }
 }
 
 function Send-Command([string]$op, [string]$cmdArg, [switch]$noWait) {
@@ -161,13 +243,9 @@ switch ($Command) {
   "run"        { Send-Command "run"  $Arg -noWait:$NoWait }
   "ping"       { Send-Command "ping" "" }
   "screenshot" { Capture-To $Arg }
-  "key" {
-    $win = Get-MainWindow
-    if ($win) { [AseCap]::SetForegroundWindow($win.Handle) | Out-Null; Start-Sleep -Milliseconds 200 }
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.SendKeys]::SendWait("{$Arg}")
-    Write-Host "sent key {$Arg}"
-  }
+  "key"  { Send-Keys $Arg $DelayMs }          # single key or name (e.g. Escape)
+  "keys" { Send-Keys $Arg $DelayMs }          # sequence, e.g. "Tab Tab Space Enter"
+  "type" { Send-Type $Arg $DelayMs }          # literal text into the focused entry
   "stop" {
     $asePid = Get-AsePid
     Remove-Item $ReadyFile -ErrorAction SilentlyContinue
@@ -176,6 +254,6 @@ switch ($Command) {
     Remove-Item $PidFile -ErrorAction SilentlyContinue
   }
   default {
-    Write-Host "usage: bridge.ps1 {start|open <file>|run <lua> [-NoWait]|screenshot <out>|key <Key>|ping|stop}"
+    Write-Host "usage: bridge.ps1 {start|open <file>|run <lua> [-NoWait]|screenshot <out>|key <Key>|keys <seq>|type <text>|ping|stop}"
   }
 }
