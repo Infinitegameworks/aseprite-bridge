@@ -1,0 +1,15 @@
+{
+  "name": "aseprite-bridge",
+  "displayName": "Aseprite Bridge",
+  "description": "Headless control bridge for driving a live Aseprite GUI (open/run/screenshot).",
+  "version": "1.0.0",
+  "author": { "name": "Infinite Gameworks" },
+  "publisher": "infinitegameworks",
+  "license": "MIT",
+  "categories": ["Scripts"],
+  "contributes": {
+    "scripts": [
+      { "path": "./bridge.lua" }
+    ]
+  }
+}

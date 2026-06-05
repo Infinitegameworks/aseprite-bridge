@@ -1,0 +1,10 @@
+# Bridge runtime queue (created under %USERPROFILE%/.aseprite-bridge at runtime)
+.aseprite-bridge/
+
+# Scratch screenshots / captures
+*.png
+!docs/**/*.png
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
